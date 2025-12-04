@@ -1,0 +1,41 @@
+{
+  "manifest_version": 3,
+  "name": "Clueso Recorder (React)",
+  "version": "1.0.0",
+  "description": "Records screen (video) and microphone (audio) separately and streams to a Node server.",
+
+  "permissions": [
+    "storage",
+    "activeTab",
+    "scripting",
+    "offscreen",
+    "tabs"
+  ],
+
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+
+  "background": {
+    "service_worker": "background.js"
+  },
+
+  "action": {
+    "default_popup": "index.html",
+    "default_icon": {
+      "16": "icon16.png"
+    }
+  },
+
+  "icons": {
+    "16": "icon16.png"
+  },
+
+  "web_accessible_resources": [
+    {
+      "resources": ["offscreen.html", "offscreen.js"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}
