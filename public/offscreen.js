@@ -7,6 +7,7 @@ let micStream = null;
 
 const VIDEO_UPLOAD_URL = "http://localhost:3000/api/v1/recording/video-chunk";
 const AUDIO_UPLOAD_URL = "http://localhost:3000/api/v1/recording/audio-chunk";
+const REDIRECT_URL = "http://localhost:3001/dashboard";
 
 let isRecording = false;
 
@@ -105,6 +106,38 @@ function stopRecording() {
   }
 
   isRecording = false;
+
+  // Finalize recording on backend
+  finalizeRecording();
+}
+
+async function finalizeRecording() {
+  try {
+    console.log("[offscreen] finalizing recording...");
+    
+    const response = await fetch('http://localhost:3000/api/recording/process-recording', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        // Include any metadata needed by your backend
+        timestamp: new Date().toISOString()
+      })
+    });
+
+    const result = await response.json();
+    const sessionId = result.sessionId;
+
+    console.log("[offscreen] recording finalized, sessionId:", sessionId);
+
+    // Redirect to dashboard
+    if (sessionId) {
+      chrome.tabs.create({
+        url: `http://localhost:3001/dashboard/${sessionId}`
+      });
+    }
+  } catch (err) {
+    console.error("[offscreen] finalization error:", err);
+  }
 }
 
 function uploadVideoChunk(blob) {

@@ -349,4 +349,3 @@ async function ensureOffscreen() {
     creatingOffscreen = false;
   }
 }
-
