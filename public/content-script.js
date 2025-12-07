@@ -6,29 +6,28 @@ let events = [];
 let isRecording = false;
 let scrollTimeout = null;
 let mutationObserver = null;
+let currentSessionId = null;  // ← ADD THIS - stores sessionId from background
 
-// Generate unique session ID
-function generateSessionId() {
-  return `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-}
+// ← REMOVE generateSessionId() function - not needed anymore
 
 // Initialize recording session
-function startRecording() {
+function startRecording(sessionId) {  // ← ADD parameter
   recordingStartTime = Date.now();
   events = [];
   isRecording = true;
+  currentSessionId = sessionId;  // ← STORE sessionId from background
   attachEventListeners();
   startMutationObserver();
-  console.log('[content-script] Recording started');
+  console.log('[content-script] Recording started with sessionId:', sessionId);
 }
 
 function stopRecording() {
   isRecording = false;
   removeEventListeners();
   stopMutationObserver();
-  
+
   const sessionData = {
-    sessionId: generateSessionId(),
+    sessionId: currentSessionId,  // ← USE stored sessionId (not generated)
     startTime: recordingStartTime,
     endTime: Date.now(),
     url: window.location.href,
@@ -38,8 +37,9 @@ function stopRecording() {
     },
     events: events
   };
-  
-  console.log('[content-script] Recording stopped, events captured:', events.length);
+
+  console.log('[content-script] Recording stopped, sessionId:', currentSessionId);
+  console.log('[content-script] Events captured:', events.length);
   return sessionData;
 }
 
@@ -47,31 +47,31 @@ function stopRecording() {
 function attachEventListeners() {
   // Click events
   document.addEventListener('click', handleClick, true); // Use capture phase
-  
+
   // Input events
   document.addEventListener('input', handleInput, true);
   document.addEventListener('change', handleChange, true);
-  
+
   // Focus events
   document.addEventListener('focus', handleFocus, true);
   document.addEventListener('blur', handleBlur, true);
-  
+
   // Scroll events (debounced)
   window.addEventListener('scroll', handleScrollDebounced, true);
-  
+
   // Page navigation detection
   window.addEventListener('popstate', handleStepChange);
-  
+
   // Intercept pushState/replaceState for SPA navigation
   const originalPushState = history.pushState;
   const originalReplaceState = history.replaceState;
-  
-  history.pushState = function(...args) {
+
+  history.pushState = function (...args) {
     originalPushState.apply(history, args);
     handleStepChange();
   };
-  
-  history.replaceState = function(...args) {
+
+  history.replaceState = function (...args) {
     originalReplaceState.apply(history, args);
     handleStepChange();
   };
@@ -90,10 +90,10 @@ function removeEventListeners() {
 // Click event handler
 function handleClick(e) {
   if (!isRecording) return;
-  
+
   const target = e.target;
   const bbox = target.getBoundingClientRect();
-  
+
   const event = {
     timestamp: Date.now() - recordingStartTime,
     type: 'click',
@@ -119,7 +119,7 @@ function handleClick(e) {
       }
     }
   };
-  
+
   events.push(event);
   sendEventToBackground(event);
 }
@@ -127,12 +127,12 @@ function handleClick(e) {
 // Input event handler
 function handleInput(e) {
   if (!isRecording) return;
-  
+
   const target = e.target;
   if (!target.matches('input, textarea, select')) return;
-  
+
   const bbox = target.getBoundingClientRect();
-  
+
   const event = {
     timestamp: Date.now() - recordingStartTime,
     type: 'type',
@@ -161,7 +161,7 @@ function handleInput(e) {
       }
     }
   };
-  
+
   events.push(event);
   sendEventToBackground(event);
 }
@@ -169,12 +169,12 @@ function handleInput(e) {
 // Change event handler (for select dropdowns, checkboxes, etc.)
 function handleChange(e) {
   if (!isRecording) return;
-  
+
   const target = e.target;
   if (!target.matches('input, textarea, select')) return;
-  
+
   const bbox = target.getBoundingClientRect();
-  
+
   const event = {
     timestamp: Date.now() - recordingStartTime,
     type: 'type',
@@ -194,8 +194,8 @@ function handleChange(e) {
       type: target.type || null,
       name: target.name || null
     },
-    value: target.type === 'checkbox' || target.type === 'radio' 
-      ? target.checked 
+    value: target.type === 'checkbox' || target.type === 'radio'
+      ? target.checked
       : target.value,
     metadata: {
       url: window.location.href,
@@ -205,7 +205,7 @@ function handleChange(e) {
       }
     }
   };
-  
+
   events.push(event);
   sendEventToBackground(event);
 }
@@ -213,12 +213,12 @@ function handleChange(e) {
 // Focus event handler
 function handleFocus(e) {
   if (!isRecording) return;
-  
+
   const target = e.target;
   if (!target.matches('input, textarea, select')) return;
-  
+
   const bbox = target.getBoundingClientRect();
-  
+
   const event = {
     timestamp: Date.now() - recordingStartTime,
     type: 'focus',
@@ -246,19 +246,19 @@ function handleFocus(e) {
       }
     }
   };
-  
+
   events.push(event);
 }
 
 // Blur event handler
 function handleBlur(e) {
   if (!isRecording) return;
-  
+
   const target = e.target;
   if (!target.matches('input, textarea, select')) return;
-  
+
   const bbox = target.getBoundingClientRect();
-  
+
   const event = {
     timestamp: Date.now() - recordingStartTime,
     type: 'blur',
@@ -286,14 +286,14 @@ function handleBlur(e) {
       }
     }
   };
-  
+
   events.push(event);
 }
 
 // Debounced scroll handler
 function handleScrollDebounced() {
   if (!isRecording) return;
-  
+
   clearTimeout(scrollTimeout);
   scrollTimeout = setTimeout(() => {
     handleScroll();
@@ -303,7 +303,7 @@ function handleScrollDebounced() {
 // Scroll event handler
 function handleScroll() {
   if (!isRecording) return;
-  
+
   const event = {
     timestamp: Date.now() - recordingStartTime,
     type: 'scroll',
@@ -319,14 +319,14 @@ function handleScroll() {
       }
     }
   };
-  
+
   events.push(event);
 }
 
 // Step change handler (page navigation, major UI changes)
 function handleStepChange() {
   if (!isRecording) return;
-  
+
   const event = {
     timestamp: Date.now() - recordingStartTime,
     type: 'step_change',
@@ -338,7 +338,7 @@ function handleStepChange() {
       }
     }
   };
-  
+
   events.push(event);
 }
 
@@ -346,22 +346,22 @@ function handleStepChange() {
 function startMutationObserver() {
   mutationObserver = new MutationObserver((mutations) => {
     if (!isRecording) return;
-    
+
     // Detect major UI changes (modals, page transitions)
     const hasMajorChange = mutations.some(mutation => {
-      return mutation.addedNodes.length > 5 || 
-             mutation.removedNodes.length > 5 ||
-             Array.from(mutation.addedNodes).some(node => 
-               node.nodeType === 1 && 
-               (node.matches?.('dialog, [role="dialog"], .modal, .overlay') || false)
-             );
+      return mutation.addedNodes.length > 5 ||
+        mutation.removedNodes.length > 5 ||
+        Array.from(mutation.addedNodes).some(node =>
+          node.nodeType === 1 &&
+          (node.matches?.('dialog, [role="dialog"], .modal, .overlay') || false)
+        );
     });
-    
+
     if (hasMajorChange) {
       handleStepChange();
     }
   });
-  
+
   mutationObserver.observe(document.body, {
     childList: true,
     subtree: true
@@ -380,7 +380,7 @@ function generateSelector(element) {
   if (element.id) {
     return `#${element.id}`;
   }
-  
+
   if (element.className) {
     const classes = Array.from(element.classList)
       .filter(cls => !cls.startsWith('_')) // Filter out framework classes
@@ -389,7 +389,7 @@ function generateSelector(element) {
       return `${element.tagName.toLowerCase()}.${classes}`;
     }
   }
-  
+
   // Fallback: use path
   const path = [];
   let current = element;
@@ -407,18 +407,18 @@ function generateSelector(element) {
         .join('.');
       if (classes) selector += `.${classes}`;
     }
-    
+
     const siblings = Array.from(current.parentElement?.children || [])
       .filter(el => el.tagName === current.tagName);
     if (siblings.length > 1) {
       const index = siblings.indexOf(current) + 1;
       selector += `:nth-of-type(${index})`;
     }
-    
+
     path.unshift(selector);
     current = current.parentElement;
   }
-  
+
   return path.join(' > ');
 }
 
@@ -428,7 +428,7 @@ function getVisibleText(element) {
   const clone = element.cloneNode(true);
   const hidden = clone.querySelectorAll('[style*="display: none"], [style*="visibility: hidden"], [hidden]');
   hidden.forEach(el => el.remove());
-  
+
   return clone.textContent?.trim() || null;
 }
 
@@ -436,14 +436,14 @@ function getVisibleText(element) {
 function getImportantAttributes(element) {
   const important = ['data-testid', 'aria-label', 'aria-labelledby', 'name', 'type', 'role'];
   const attrs = {};
-  
+
   important.forEach(attr => {
     const value = element.getAttribute(attr);
     if (value) {
       attrs[attr] = value;
     }
   });
-  
+
   return attrs;
 }
 
@@ -466,21 +466,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     sendResponse({ success: true, ready: true });
     return true;
   }
-  
+
   if (message.type === 'START_RECORDING') {
-    startRecording();
+    // ← RECEIVE sessionId from background
+    startRecording(message.sessionId);
     sendResponse({ success: true });
     return true;
   }
-  
+
   if (message.type === 'STOP_RECORDING') {
     const sessionData = stopRecording();
     sendResponse({ success: true, sessionData: sessionData });
     return true;
   }
-  
+
   return true; // Keep message channel open for async response
 });
 
 console.log('[content-script] Content script loaded');
-

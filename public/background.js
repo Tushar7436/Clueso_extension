@@ -11,8 +11,15 @@ let currentTabId = null;
 chrome.runtime.onMessage.addListener(async (msg, sender, sendResponse) => {
   try {
     if (msg?.type === "START_RECORDING") {
+      // Generate sessionId FIRST
+      const sessionId = generateSessionId();
+      console.log("[background] Generated sessionId:", sessionId);
+
       // Mark recording state and notify any open popups
-      await chrome.storage.local.set({ isRecording: true });
+      await chrome.storage.local.set({
+        isRecording: true,
+        currentSessionId: sessionId  // ← Store sessionId
+      });
       chrome.runtime.sendMessage({ type: "RECORDING_STATUS", isRecording: true });
 
       // Get active tab and inject content script
@@ -20,11 +27,14 @@ chrome.runtime.onMessage.addListener(async (msg, sender, sendResponse) => {
       if (tabs[0]) {
         currentTabId = tabs[0].id;
         await injectContentScript(tabs[0].id);
-        
+
         // Start content script recording with retry
         try {
-          await sendMessageWithRetry(tabs[0].id, { type: "START_RECORDING" }, 3, 200);
-          console.log("[background] Content script recording started");
+          await sendMessageWithRetry(tabs[0].id, {
+            type: "START_RECORDING",
+            sessionId: sessionId  // ← ADD THIS
+          }, 3, 200);
+          console.log("[background] Content script recording started with sessionId:", sessionId);
         } catch (error) {
           console.error("[background] Failed to start content script recording:", error);
           // Continue anyway - events will be buffered if content script becomes available
@@ -32,9 +42,12 @@ chrome.runtime.onMessage.addListener(async (msg, sender, sendResponse) => {
       }
 
       await ensureOffscreen();
-      console.log("[background] Sending OFFSCREEN_START");
-      chrome.runtime.sendMessage({ type: "OFFSCREEN_START" });
-      
+      console.log("[background] Sending OFFSCREEN_START with sessionId:", sessionId);
+      chrome.runtime.sendMessage({
+        type: "OFFSCREEN_START",
+        sessionId: sessionId  // ← Pass sessionId to offscreen
+      });
+
       // Clear event buffer
       eventBuffer = [];
     }
@@ -45,9 +58,10 @@ chrome.runtime.onMessage.addListener(async (msg, sender, sendResponse) => {
       chrome.runtime.sendMessage({ type: "RECORDING_STATUS", isRecording: false });
 
       // Stop content script recording and collect events
+      let sessionId = null;
+      let sessionDataSent = false;
+
       if (currentTabId !== null) {
-        let sessionDataSent = false;
-        
         try {
           // First, check if tab still exists and content script is available
           const tab = await chrome.tabs.get(currentTabId).catch(() => null);
@@ -62,6 +76,9 @@ chrome.runtime.onMessage.addListener(async (msg, sender, sendResponse) => {
                 const response = await sendMessageWithRetry(currentTabId, { type: "STOP_RECORDING" }, 3, 300);
                 if (response && response.sessionData) {
                   console.log("[background] Received session data from content script");
+                  // CAPTURE sessionId from content script response
+                  sessionId = response.sessionData.sessionId;
+                  console.log("[background] Captured sessionId from content script:", sessionId);
                   await sendEventsToNodeServer(response.sessionData);
                   sessionDataSent = true;
                 }
@@ -73,35 +90,40 @@ chrome.runtime.onMessage.addListener(async (msg, sender, sendResponse) => {
               console.log("[background] Content script not available, will use buffered events");
             }
           }
-          
+
           // If we didn't get data from content script, use buffered events
           if (!sessionDataSent) {
             if (eventBuffer.length > 0) {
               console.log("[background] Using buffered events:", eventBuffer.length, "events");
               const tab = await chrome.tabs.get(currentTabId).catch(() => null);
+              sessionId = generateSessionId();
               const sessionData = {
-                sessionId: generateSessionId(),
+                sessionId: sessionId,
                 startTime: Date.now() - 60000,
                 endTime: Date.now(),
                 url: tab?.url || "unknown",
                 viewport: { width: 0, height: 0 },
                 events: eventBuffer
               };
+              console.log("[background] Generated sessionId for buffered events:", sessionId);
               await sendEventsToNodeServer(sessionData);
               sessionDataSent = true;
             } else {
               console.warn("[background] No events available (content script unavailable and no buffered events)");
               // Send empty session to indicate recording completed but no events captured
               const tab = await chrome.tabs.get(currentTabId).catch(() => null);
+              sessionId = generateSessionId();
               const sessionData = {
-                sessionId: generateSessionId(),
+                sessionId: sessionId,
                 startTime: Date.now() - 60000,
                 endTime: Date.now(),
                 url: tab?.url || "unknown",
                 viewport: { width: 0, height: 0 },
                 events: []
               };
+              console.log("[background] Generated sessionId for empty session:", sessionId);
               await sendEventsToNodeServer(sessionData);
+              sessionDataSent = true;
             }
           }
         } catch (error) {
@@ -109,28 +131,71 @@ chrome.runtime.onMessage.addListener(async (msg, sender, sendResponse) => {
           if (!error.message || !error.message.includes("Receiving end does not exist")) {
             console.error("[background] Unexpected error stopping recording:", error);
           }
-          
+
           // Try to send buffered events as last resort
           if (!sessionDataSent && eventBuffer.length > 0) {
             console.log("[background] Sending buffered events after error");
             const tab = await chrome.tabs.get(currentTabId).catch(() => null);
+            sessionId = generateSessionId();
             const sessionData = {
-              sessionId: generateSessionId(),
+              sessionId: sessionId,
               startTime: Date.now() - 60000,
               endTime: Date.now(),
               url: tab?.url || "unknown",
               viewport: { width: 0, height: 0 },
               events: eventBuffer
             };
+            console.log("[background] Generated sessionId in error fallback:", sessionId);
             await sendEventsToNodeServer(sessionData);
+            sessionDataSent = true;
           }
         }
-        
+
         currentTabId = null;
         eventBuffer = []; // Clear buffer after use
       }
 
-      chrome.runtime.sendMessage({ type: "OFFSCREEN_STOP" });
+      // Handle case where currentTabId was null (tab closed or never set)
+      if (!sessionDataSent) {
+        console.log("[background] No currentTabId available, generating sessionId from buffered events or empty session");
+        if (eventBuffer.length > 0) {
+          console.log("[background] Using buffered events (no tab):", eventBuffer.length, "events");
+          sessionId = generateSessionId();
+          const sessionData = {
+            sessionId: sessionId,
+            startTime: Date.now() - 60000,
+            endTime: Date.now(),
+            url: "unknown",
+            viewport: { width: 0, height: 0 },
+            events: eventBuffer
+          };
+          console.log("[background] Generated sessionId for buffered events (no tab):", sessionId);
+          await sendEventsToNodeServer(sessionData);
+        } else {
+          // Generate sessionId even for empty session to ensure offscreen can redirect
+          sessionId = generateSessionId();
+          const sessionData = {
+            sessionId: sessionId,
+            startTime: Date.now() - 60000,
+            endTime: Date.now(),
+            url: "unknown",
+            viewport: { width: 0, height: 0 },
+            events: []
+          };
+          console.log("[background] Generated sessionId for empty session (no tab):", sessionId);
+          await sendEventsToNodeServer(sessionData);
+        }
+        eventBuffer = []; // Clear buffer
+      }
+
+      // Send OFFSCREEN_STOP with sessionId
+      if (sessionId) {
+        console.log("[background] Sending OFFSCREEN_STOP with sessionId:", sessionId);
+        chrome.runtime.sendMessage({ type: "OFFSCREEN_STOP", sessionId: sessionId });
+      } else {
+        console.warn("[background] No sessionId available, sending OFFSCREEN_STOP without sessionId");
+        chrome.runtime.sendMessage({ type: "OFFSCREEN_STOP" });
+      }
     }
 
     // Handle real-time event capture from content script
@@ -139,10 +204,24 @@ chrome.runtime.onMessage.addListener(async (msg, sender, sendResponse) => {
       // Optional: Send events in batches to Node.js server
       // For now, we'll send all events when recording stops
     }
+
+    // Handle redirect request from offscreen document
+    if (msg?.type === "REDIRECT_TO_DASHBOARD") {
+      try {
+        if (msg.url) {
+          console.log("[background] Creating tab for dashboard:", msg.url);
+          await chrome.tabs.create({ url: msg.url });
+        } else {
+          console.warn("[background] REDIRECT_TO_DASHBOARD message missing url");
+        }
+      } catch (err) {
+        console.error("[background] Failed to create dashboard tab:", err);
+      }
+    }
   } catch (err) {
     console.error("background listener error:", err);
   }
-  
+
   return true; // Keep message channel open for async responses
 });
 
@@ -200,7 +279,7 @@ async function injectContentScript(tabId) {
     // Content script not injected, inject it
     console.log("[background] Content script not found, injecting...");
   }
-  
+
   // Content script not injected, inject it
   console.log("[background] Injecting content script into tab:", tabId);
   try {
@@ -209,7 +288,7 @@ async function injectContentScript(tabId) {
       files: ["content-script.js"]
     });
     console.log("[background] Content script injected successfully");
-    
+
     // Wait for content script to initialize and be ready
     const isReady = await waitForContentScript(tabId, 5, 200);
     if (isReady) {
@@ -228,45 +307,58 @@ async function sendEventsToNodeServer(sessionData) {
   try {
     console.log("[background] Sending events to Node.js server:", sessionData.events.length, "events");
     console.log("[background] Target URL:", NODE_SERVER_URL);
-    
+
     // Create FormData for multipart/form-data request
     const formData = new FormData();
-    
+
     // Add events as JSON string
     const eventsJson = JSON.stringify(sessionData.events);
     formData.append('events', eventsJson);
     console.log("[background] Events JSON length:", eventsJson.length);
-    
+
+    // Extract path from URL
+    let path = '/';
+    try {
+      if (sessionData.url && sessionData.url !== 'unknown') {
+        const urlObj = new URL(sessionData.url);
+        path = urlObj.pathname + urlObj.search;
+      }
+    } catch (e) {
+      // If URL parsing fails, use default path
+      console.warn("[background] Failed to parse URL for path:", sessionData.url);
+    }
+
     // Add metadata as JSON string
     const metadataJson = JSON.stringify({
       sessionId: sessionData.sessionId,
       startTime: sessionData.startTime,
       endTime: sessionData.endTime,
       url: sessionData.url,
+      path: path,
       viewport: sessionData.viewport
     });
     formData.append('metadata', metadataJson);
     console.log("[background] Metadata:", metadataJson);
-    
+
     console.log("[background] Making fetch request to:", NODE_SERVER_URL);
     const response = await fetch(NODE_SERVER_URL, {
       method: 'POST',
       body: formData
       // Don't set Content-Type header - browser will set it with boundary for FormData
     });
-    
+
     console.log("[background] Response status:", response.status, response.statusText);
     console.log("[background] Response URL:", response.url);
-    
+
     if (!response.ok) {
       const errorText = await response.text();
       console.error("[background] Error response body:", errorText);
       throw new Error(`HTTP error! status: ${response.status}, message: ${errorText}`);
     }
-    
+
     const result = await response.json();
     console.log("[background] Node.js server response:", result);
-    
+
     // Send instructions to popup or store for replay
     try {
       await chrome.runtime.sendMessage({
@@ -279,7 +371,7 @@ async function sendEventsToNodeServer(sessionData) {
       // This is expected if popup is not open
       console.log("[background] No listeners for INSTRUCTIONS_RECEIVED (popup may be closed)");
     }
-    
+
     return result;
   } catch (error) {
     console.error("[background] Failed to send events to Node.js server:", error);
@@ -289,7 +381,7 @@ async function sendEventsToNodeServer(sessionData) {
       url: NODE_SERVER_URL,
       name: error.name
     });
-    
+
     // Notify popup of error (if it's open)
     try {
       await chrome.runtime.sendMessage({
@@ -301,7 +393,7 @@ async function sendEventsToNodeServer(sessionData) {
       // Ignore if no listeners (popup might be closed)
       console.log("[background] Could not notify popup of error (popup may be closed)");
     }
-    
+
     // Don't throw - just log the error so recording can complete
     return { success: false, error: error.message };
   }
