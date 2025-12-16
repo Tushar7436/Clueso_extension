@@ -6,16 +6,19 @@ let events = [];
 let isRecording = false;
 let scrollTimeout = null;
 let mutationObserver = null;
-let currentSessionId = null;  // ← ADD THIS - stores sessionId from background
-
-// ← REMOVE generateSessionId() function - not needed anymore
+let currentSessionId = null;
+// ✅ SAFE FIX #10: Track last scroll position for threshold
+let lastScrollY = 0;
+let lastScrollX = 0;
 
 // Initialize recording session
-function startRecording(sessionId) {  // ← ADD parameter
+function startRecording(sessionId) {
   recordingStartTime = Date.now();
   events = [];
   isRecording = true;
-  currentSessionId = sessionId;  // ← STORE sessionId from background
+  currentSessionId = sessionId;
+  lastScrollY = window.scrollY;
+  lastScrollX = window.scrollX;
   attachEventListeners();
   startMutationObserver();
   console.log('[content-script] Recording started with sessionId:', sessionId);
@@ -27,7 +30,7 @@ function stopRecording() {
   stopMutationObserver();
 
   const sessionData = {
-    sessionId: currentSessionId,  // ← USE stored sessionId (not generated)
+    sessionId: currentSessionId,
     startTime: recordingStartTime,
     endTime: Date.now(),
     url: window.location.href,
@@ -304,6 +307,17 @@ function handleScrollDebounced() {
 function handleScroll() {
   if (!isRecording) return;
 
+  // ✅ SAFE FIX #10: Only record scroll if moved more than 100px
+  const scrollDistanceY = Math.abs(window.scrollY - lastScrollY);
+  const scrollDistanceX = Math.abs(window.scrollX - lastScrollX);
+
+  if (scrollDistanceY < 100 && scrollDistanceX < 100) {
+    return; // Not enough movement, ignore
+  }
+
+  lastScrollY = window.scrollY;
+  lastScrollX = window.scrollX;
+
   const event = {
     timestamp: Date.now() - recordingStartTime,
     type: 'scroll',
@@ -468,7 +482,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === 'START_RECORDING') {
-    // ← RECEIVE sessionId from background
     startRecording(message.sessionId);
     sendResponse({ success: true });
     return true;

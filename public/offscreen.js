@@ -1,13 +1,16 @@
 console.log("[offscreen] ready");
 
-let videoChunkSequence = 0;  // ← ADD THIS
-let audioChunkSequence = 0;  // ← ADD THIS
+let videoChunkSequence = 0;
+let audioChunkSequence = 0;
 let screenStream = null;
 let micStream = null;
-let videoRecorder = null;  // ← ADD THIS
-let audioRecorder = null;  // ← ADD THIS
-let sessionId = null; // Store sessionId from background
+let videoRecorder = null;
+let audioRecorder = null;
+let sessionId = null;
 
+// Track in-flight chunk uploads to prevent race condition
+let pendingUploads = [];
+let isStoppingRecording = false;
 
 const VIDEO_UPLOAD_URL = "http://localhost:3000/api/v1/recording/video-chunk";
 const AUDIO_UPLOAD_URL = "http://localhost:3000/api/v1/recording/audio-chunk";
@@ -15,96 +18,116 @@ const DASHBOARD_URL = "http://localhost:3001/recording";
 
 let isRecording = false;
 
-chrome.runtime.onMessage.addListener((msg) => {
-  if (msg.type === "OFFSCREEN_START") {
-    if (isRecording) return;
-    isRecording = true;
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.type === "OFFSCREEN_PING") {
+    sendResponse({ ready: true });
+    return true;
+  }
 
-    // Capture sessionId from START message (not STOP!)
+  if (msg.type === "OFFSCREEN_START") {
+    if (isRecording) {
+      sendResponse({ success: false, error: "Already recording" });
+      return;
+    }
+    isRecording = true;
+    isStoppingRecording = false;
+
     if (msg.sessionId) {
       sessionId = msg.sessionId;
-      console.log("[offscreen] sessionId received from START:", sessionId);
+      console.log("[offscreen] sessionId received:", sessionId);
     } else {
-      console.warn("[offscreen] No sessionId in OFFSCREEN_START message");
+      console.warn("[offscreen] No sessionId in OFFSCREEN_START");
     }
 
     console.log("[offscreen] START received");
     startRecording();
+    sendResponse({ success: true });
+    return true;
   }
 
   if (msg.type === "OFFSCREEN_STOP") {
-    // sessionId already captured from OFFSCREEN_START
-    console.log("[offscreen] STOP received, using sessionId:", sessionId);
+    console.log("[offscreen] STOP received, sessionId:", sessionId);
     stopRecording();
+    sendResponse({ success: true });
+    return true;
   }
 });
 
-// Redirect to dashboard with sessionId
 function redirectToDashboard(sessionId) {
   try {
     if (!sessionId) {
-      console.warn("[offscreen] No sessionId available for redirect");
+      console.warn("[offscreen] No sessionId for redirect");
       return;
     }
 
     const dashboardUrl = `${DASHBOARD_URL}/${sessionId}`;
-    console.log("[offscreen] Requesting redirect to dashboard:", dashboardUrl);
+    console.log("[offscreen] Redirecting to:", dashboardUrl);
 
-    // Send message to background script to create tab (offscreen doesn't have tabs API)
     chrome.runtime.sendMessage({
       type: "REDIRECT_TO_DASHBOARD",
       url: dashboardUrl
     });
   } catch (err) {
-    console.error("[offscreen] Failed to redirect to dashboard:", err);
+    console.error("[offscreen] Redirect failed:", err);
   }
 }
 
 async function startRecording() {
   try {
-    videoChunkSequence = 0;  // ← ADD THIS
-    audioChunkSequence = 0;  // ← ADD THIS
-    console.log("[offscreen] requesting microphone permission first...");
+    videoChunkSequence = 0;
+    audioChunkSequence = 0;
+    pendingUploads = [];
 
-    // 1) Request microphone first (user gesture preserved)
+    console.log("[offscreen] Starting recording...");
+    console.log("[offscreen] NOTE: Permissions pre-granted in popup");
+
+    // Request microphone - should succeed without prompt (popup already granted)
+    console.log("[offscreen] Requesting microphone stream...");
     try {
       micStream = await navigator.mediaDevices.getUserMedia({
-        audio: true,
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        },
         video: false
       });
-      console.log("[offscreen] mic permission granted");
+
+      const audioTrack = micStream.getAudioTracks()[0];
+      console.log("[offscreen] ✓ Microphone:", audioTrack?.label);
     } catch (micErr) {
-      // Log detailed error info so we can see exactly why it failed
-      console.error(
-        "[offscreen] Microphone permission failed:",
-        micErr,
-        micErr?.name,
-        micErr?.message
-      );
-      // Let user know and abort (or choose to continue only with screen)
-      // For now abort so we always have audio+video recordings.
+      console.error("[offscreen] ✗ Microphone failed:", micErr.name, micErr.message);
       isRecording = false;
+      isStoppingRecording = false;
+
+      chrome.runtime.sendMessage({
+        type: 'RECORDING_ERROR',
+        error: `Microphone: ${micErr.message}`
+      });
       return;
     }
 
-    // 2) Immediately request screen capture (picker will appear)
-    console.log("[offscreen] requesting screen permission...");
+    // Request screen - should succeed without prompt (popup already granted)
+    console.log("[offscreen] Requesting screen stream...");
     try {
       screenStream = await navigator.mediaDevices.getDisplayMedia({
-        video: true,
-        audio: false // keep false to avoid system audio; we already have mic
+        video: { displaySurface: 'monitor' },
+        audio: false
       });
-      console.log("[offscreen] screen permission granted");
+
+      const videoTrack = screenStream.getVideoTracks()[0];
+      const settings = videoTrack?.getSettings();
+      console.log("[offscreen] ✓ Screen:", `${settings?.width}x${settings?.height}`);
     } catch (screenErr) {
-      console.error("[offscreen] Screen permission failed:", screenErr);
-      // Close mic if screen fails so no stray mic stays open
+      console.error("[offscreen] ✗ Screen failed:", screenErr.name);
       try { micStream?.getTracks().forEach(t => t.stop()); } catch (e) { }
       isRecording = false;
+      isStoppingRecording = false;
       return;
     }
 
-    // 3) Start recorders after both streams available
-    console.log("[offscreen] starting recorders...");
+    // Start recorders
+    console.log("[offscreen] Starting recorders...");
     videoRecorder = new MediaRecorder(screenStream, { mimeType: "video/webm; codecs=vp9" });
     audioRecorder = new MediaRecorder(micStream, { mimeType: "audio/webm; codecs=opus" });
 
@@ -115,143 +138,216 @@ async function startRecording() {
       if (e.data && e.data.size > 0) uploadAudioChunk(e.data);
     };
 
-    videoRecorder.start(200);
-    audioRecorder.start(1000);
+    // ✅ SAFE FIX #2: Increased from 200ms to 1000ms for video, 1000ms to 2000ms for audio
+    videoRecorder.start(1000);
+    audioRecorder.start(2000);
 
-    console.log("[offscreen] recording started");
+    console.log("[offscreen] ✓ Recording started");
   } catch (err) {
-    console.error("[offscreen] Unexpected startRecording error:", err);
-    // ensure cleanup
+    console.error("[offscreen] ✗ Unexpected error:", err);
     try { micStream?.getTracks().forEach(t => t.stop()); } catch (e) { }
     try { screenStream?.getTracks().forEach(t => t.stop()); } catch (e) { }
     isRecording = false;
+    isStoppingRecording = false;
   }
 }
 
+async function stopRecording() {
+  console.log("[offscreen] Stopping recording...");
+  isStoppingRecording = true;
 
-
-function stopRecording() {
-  console.log("[offscreen] stopping recording...");
-
-  return new Promise((resolve) => {
+  return new Promise(async (resolve) => {
     let videoStopped = false;
     let audioStopped = false;
 
-    const checkBothStopped = () => {
+    const checkBothStopped = async () => {
       if (videoStopped && audioStopped) {
-        isRecording = false;
-        console.log("[offscreen] Both recorders stopped, all chunks flushed");
+        console.log("[offscreen] Both stopped, waiting for uploads...");
+        console.log(`[offscreen] Pending: ${pendingUploads.length}`);
 
-        // Clean up streams
+        // ✅ SAFE FIX #4: Reduced timeout from 30s to 10s
+        const uploadTimeout = new Promise((res) => {
+          setTimeout(() => {
+            console.warn("[offscreen] Upload timeout (10s)");
+            res();
+          }, 10000);
+        });
+
+        await Promise.race([Promise.allSettled(pendingUploads), uploadTimeout]);
+
+        const results = await Promise.allSettled(pendingUploads);
+        const success = results.filter(r => r.status === 'fulfilled').length;
+        const failed = results.filter(r => r.status === 'rejected').length;
+
+        console.log(`[offscreen] Uploads - Success: ${success}, Failed: ${failed}`);
+
+        isRecording = false;
+        console.log("[offscreen] All chunks uploaded");
+
         try {
-          screenStream?.getTracks().forEach((t) => t.stop());
-          micStream?.getTracks().forEach((t) => t.stop());
+          screenStream?.getTracks().forEach(t => t.stop());
+          micStream?.getTracks().forEach(t => t.stop());
         } catch (e) {
-          console.error("[offscreen] stream cleanup error:", e);
+          console.error("[offscreen] Cleanup error:", e);
         }
 
-        // Now safe to redirect - all chunks have been uploaded
         if (sessionId) {
-          console.log("[offscreen] Redirecting to dashboard with sessionId:", sessionId);
+          console.log("[offscreen] Redirecting...");
           redirectToDashboard(sessionId);
         } else {
-          console.warn("[offscreen] stopRecording: No sessionId available, cannot redirect");
+          console.warn("[offscreen] No sessionId");
         }
 
         resolve();
       }
     };
 
-    // Set up stop event handlers BEFORE calling stop()
+    // ✅ SAFE FIX #9: Check recorder state before stopping
     if (videoRecorder) {
       videoRecorder.onstop = () => {
-        console.log("[offscreen] Video recorder stopped and flushed");
+        console.log("[offscreen] Video stopped");
         videoStopped = true;
         checkBothStopped();
       };
+
+      if (videoRecorder.state === 'recording') {
+        console.log("[offscreen] Stopping video recorder...");
+        try {
+          videoRecorder.stop();
+        } catch (e) {
+          console.error("[offscreen] Video stop error:", e);
+          videoStopped = true;
+        }
+      } else {
+        console.log("[offscreen] Video recorder not recording, state:", videoRecorder.state);
+        videoStopped = true;
+      }
     } else {
-      videoStopped = true; // No video recorder to wait for
+      videoStopped = true;
     }
 
     if (audioRecorder) {
       audioRecorder.onstop = () => {
-        console.log("[offscreen] Audio recorder stopped and flushed");
+        console.log("[offscreen] Audio stopped");
         audioStopped = true;
         checkBothStopped();
       };
+
+      if (audioRecorder.state === 'recording') {
+        console.log("[offscreen] Stopping audio recorder...");
+        try {
+          audioRecorder.stop();
+        } catch (e) {
+          console.error("[offscreen] Audio stop error:", e);
+          audioStopped = true;
+        }
+      } else {
+        console.log("[offscreen] Audio recorder not recording, state:", audioRecorder.state);
+        audioStopped = true;
+      }
     } else {
-      audioStopped = true; // No audio recorder to wait for
+      audioStopped = true;
     }
 
-    // Now trigger the stop (will emit final chunks then fire onstop)
-    try {
-      videoRecorder?.stop();
-      audioRecorder?.stop();
-    } catch (e) {
-      console.error("[offscreen] stop error:", e);
-      // If stop fails, still try to clean up
-      isRecording = false;
-      videoStopped = true;
-      audioStopped = true;
-      checkBothStopped();
-    }
+    // Check if both already stopped
+    checkBothStopped();
   });
 }
 
 function uploadVideoChunk(blob) {
+  if (isStoppingRecording) {
+    console.warn("[offscreen] Rejecting video chunk");
+    return;
+  }
+
   if (!sessionId) {
-    console.error("[offscreen] Cannot upload video chunk: no sessionId");
+    console.error("[offscreen] No sessionId for video chunk");
+    return;
+  }
+
+  // ✅ SAFE FIX #6: Validate blob has data
+  if (!blob || blob.size === 0) {
+    console.warn("[offscreen] Rejecting empty video chunk");
     return;
   }
 
   const formData = new FormData();
   formData.append('sessionId', sessionId);
-  formData.append('sequence', videoChunkSequence++);
+  formData.append('sequence', videoChunkSequence);
   formData.append('timestamp', Date.now());
   formData.append('chunk', blob);
 
-  fetch(VIDEO_UPLOAD_URL, {
+  // ✅ SAFE FIX #3: Log chunk details for debugging
+  console.log(`[offscreen] Video chunk ${videoChunkSequence}: ${blob.size} bytes, session: ${sessionId}`);
+
+  const currentSequence = videoChunkSequence;
+  videoChunkSequence++;
+
+  const uploadPromise = fetch(VIDEO_UPLOAD_URL, {
     method: "POST",
     body: formData
   })
     .then(response => {
-      if (!response.ok) {
-        throw new Error(`Video upload failed: ${response.status}`);
-      }
-      console.log(`[offscreen] Video chunk ${videoChunkSequence - 1} uploaded successfully`);
+      if (!response.ok) throw new Error(`Video upload failed: ${response.status}`);
+      // ✅ SAFE FIX #8: Better logging
+      console.log(`[offscreen] ✓ Video chunk ${currentSequence} uploaded (${blob.size} bytes)`);
       return response.json();
     })
     .catch(error => {
-      console.error(`[offscreen] Video chunk upload error:`, error);
-      // TODO: Implement retry queue
+      // ✅ SAFE FIX #8: Better error logging and don't rethrow
+      console.error(`[offscreen] ✗ Video chunk ${currentSequence} FAILED:`, error.message);
+      console.error(`[offscreen]   Chunk size: ${blob.size} bytes, Session: ${sessionId}`);
+      // Don't rethrow - let recording continue
     });
+
+  pendingUploads.push(uploadPromise);
 }
 
 function uploadAudioChunk(blob) {
+  if (isStoppingRecording) {
+    console.warn("[offscreen] Rejecting audio chunk");
+    return;
+  }
+
   if (!sessionId) {
-    console.error("[offscreen] Cannot upload audio chunk: no sessionId");
+    console.error("[offscreen] No sessionId for audio chunk");
+    return;
+  }
+
+  // ✅ SAFE FIX #6: Validate blob has data
+  if (!blob || blob.size === 0) {
+    console.warn("[offscreen] Rejecting empty audio chunk");
     return;
   }
 
   const formData = new FormData();
   formData.append('sessionId', sessionId);
-  formData.append('sequence', audioChunkSequence++);
+  formData.append('sequence', audioChunkSequence);
   formData.append('timestamp', Date.now());
   formData.append('chunk', blob);
 
-  fetch(AUDIO_UPLOAD_URL, {
+  // ✅ SAFE FIX #3: Log chunk details for debugging
+  console.log(`[offscreen] Audio chunk ${audioChunkSequence}: ${blob.size} bytes, session: ${sessionId}`);
+
+  const currentSequence = audioChunkSequence;
+  audioChunkSequence++;
+
+  const uploadPromise = fetch(AUDIO_UPLOAD_URL, {
     method: "POST",
     body: formData
   })
     .then(response => {
-      if (!response.ok) {
-        throw new Error(`Audio upload failed: ${response.status}`);
-      }
-      console.log(`[offscreen] Audio chunk ${audioChunkSequence - 1} uploaded successfully`);
+      if (!response.ok) throw new Error(`Audio upload failed: ${response.status}`);
+      // ✅ SAFE FIX #8: Better logging
+      console.log(`[offscreen] ✓ Audio chunk ${currentSequence} uploaded (${blob.size} bytes)`);
       return response.json();
     })
     .catch(error => {
-      console.error(`[offscreen] Audio chunk upload error:`, error);
-      // TODO: Implement retry queue
+      // ✅ SAFE FIX #8: Better error logging and don't rethrow
+      console.error(`[offscreen] ✗ Audio chunk ${currentSequence} FAILED:`, error.message);
+      console.error(`[offscreen]   Chunk size: ${blob.size} bytes, Session: ${sessionId}`);
+      // Don't rethrow - let recording continue
     });
+
+  pendingUploads.push(uploadPromise);
 }

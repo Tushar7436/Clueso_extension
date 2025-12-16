@@ -6,11 +6,24 @@ const NODE_SERVER_URL = "http://localhost:3000/api/v1/recording/process-recordin
 // Event storage for buffering events from content script
 let eventBuffer = [];
 let currentTabId = null;
+let isCurrentlyRecording = false; // Guard against multiple simultaneous recordings
 
 // ---- SINGLE message listener (correct) ----
 chrome.runtime.onMessage.addListener(async (msg, sender, sendResponse) => {
   try {
     if (msg?.type === "START_RECORDING") {
+      // Guard against multiple simultaneous recordings
+      if (isCurrentlyRecording) {
+        console.warn("[background] Recording already in progress, ignoring START_RECORDING");
+        return;
+      }
+      isCurrentlyRecording = true;
+
+      // ✅ SAFE FIX #1: Clear old events from previous recordings
+      eventBuffer = [];
+      currentTabId = null;
+      console.log("[background] Event buffer cleared for new recording");
+
       // Generate sessionId FIRST
       const sessionId = generateSessionId();
       console.log("[background] Generated sessionId:", sessionId);
@@ -18,7 +31,7 @@ chrome.runtime.onMessage.addListener(async (msg, sender, sendResponse) => {
       // Mark recording state and notify any open popups
       await chrome.storage.local.set({
         isRecording: true,
-        currentSessionId: sessionId  // ← Store sessionId
+        currentSessionId: sessionId  // Store sessionId
       });
       chrome.runtime.sendMessage({ type: "RECORDING_STATUS", isRecording: true });
 
@@ -30,10 +43,11 @@ chrome.runtime.onMessage.addListener(async (msg, sender, sendResponse) => {
 
         // Start content script recording with retry
         try {
+          // ✅ SAFE FIX #7: Increased retries from 3 to 5, delay from 200ms to 300ms
           await sendMessageWithRetry(tabs[0].id, {
             type: "START_RECORDING",
-            sessionId: sessionId  // ← ADD THIS
-          }, 3, 200);
+            sessionId: sessionId
+          }, 5, 300);
           console.log("[background] Content script recording started with sessionId:", sessionId);
         } catch (error) {
           console.error("[background] Failed to start content script recording:", error);
@@ -42,17 +56,31 @@ chrome.runtime.onMessage.addListener(async (msg, sender, sendResponse) => {
       }
 
       await ensureOffscreen();
+
+      // Wait for offscreen to be ready before sending START
+      console.log("[background] Waiting for offscreen to be ready...");
+      const offscreenReady = await waitForOffscreenReady(5, 200);
+      if (!offscreenReady) {
+        console.error("[background] Offscreen document not ready, cannot start recording");
+        isCurrentlyRecording = false;
+        await chrome.storage.local.set({ isRecording: false });
+        return;
+      }
+
       console.log("[background] Sending OFFSCREEN_START with sessionId:", sessionId);
       chrome.runtime.sendMessage({
         type: "OFFSCREEN_START",
-        sessionId: sessionId  // ← Pass sessionId to offscreen
+        sessionId: sessionId
       });
 
-      // Clear event buffer
+      // Clear event buffer (already done above, but keeping for clarity)
       eventBuffer = [];
     }
 
     if (msg?.type === "STOP_RECORDING") {
+      // Clear recording guard
+      isCurrentlyRecording = false;
+
       // Clear recording state and notify any open popups
       await chrome.storage.local.set({ isRecording: false });
       chrome.runtime.sendMessage({ type: "RECORDING_STATUS", isRecording: false });
@@ -201,6 +229,7 @@ chrome.runtime.onMessage.addListener(async (msg, sender, sendResponse) => {
     // Handle real-time event capture from content script
     if (msg?.type === "EVENT_CAPTURED") {
       eventBuffer.push(msg.event);
+      console.log(`[background] Event buffered: ${eventBuffer.length} total`);
       // Optional: Send events in batches to Node.js server
       // For now, we'll send all events when recording stops
     }
@@ -404,6 +433,40 @@ function generateSessionId() {
   return `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 }
 
+// Wait for offscreen document to be ready
+async function waitForOffscreenReady(maxRetries = 5, delay = 200) {
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      // Try to send a ping message to offscreen
+      const response = await new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('Timeout')), 1000);
+        chrome.runtime.sendMessage({ type: "OFFSCREEN_PING" }, (response) => {
+          clearTimeout(timeout);
+          if (chrome.runtime.lastError) {
+            reject(chrome.runtime.lastError);
+          } else {
+            resolve(response);
+          }
+        });
+      });
+
+      if (response && response.ready) {
+        console.log("[background] Offscreen document is ready");
+        return true;
+      }
+    } catch (error) {
+      if (i < maxRetries - 1) {
+        console.log(`[background] Offscreen not ready, retrying... (${i + 1}/${maxRetries})`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      } else {
+        console.error("[background] Offscreen document failed to respond:", error);
+        return false;
+      }
+    }
+  }
+  return false;
+}
+
 // ---- SAFE offscreen creation logic ----
 let creatingOffscreen = false;
 
@@ -441,3 +504,23 @@ async function ensureOffscreen() {
     creatingOffscreen = false;
   }
 }
+
+// === KEEP ALIVE ========================================
+// Chrome terminates service workers after 30s of inactivity
+// Use 20-second interval (0.33 minutes) to keep worker alive during recordings
+try {
+  chrome.alarms.create('keepAlive', { periodInMinutes: 0.33 }); // 20 seconds
+  chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name === 'keepAlive') {
+      // Simple ping to keep service worker alive
+      chrome.runtime.getPlatformInfo(() => { });
+      // Uncomment for debugging:
+      // console.log('[background] keepAlive ping', new Date().toISOString());
+    }
+  });
+  console.log('[background] keepAlive alarm created (20s interval)');
+} catch (e) {
+  console.warn('[background] alarms not available', e);
+}
+
+console.log('[background] Service Worker Activated', new Date().toISOString());
