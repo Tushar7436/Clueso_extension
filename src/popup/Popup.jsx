@@ -1,114 +1,100 @@
 // src/popup/Popup.jsx
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useState } from "react";
 
 export default function Popup() {
-  const [recording, setRecording] = useState(false);
-  const [countdown, setCountdown] = useState(0);
-  const countdownRef = useRef(null);
+  const [isRecording, setIsRecording] = useState(false);
+  const [status, setStatus] = useState("Ready");
 
-  // On mount, sync with stored recording state and listen for updates
+  // ─────────────────────────────────────────────
+  // Sync state from background ONLY
+  // ─────────────────────────────────────────────
   useEffect(() => {
-    // Get initial state from storage so popup reflects real status
-    chrome.storage.local.get('isRecording', (res) => {
-      setRecording(!!res.isRecording);
+    // Initial sync
+    chrome.storage.local.get("isRecording", (res) => {
+      setIsRecording(!!res.isRecording);
+      setStatus(res.isRecording ? "Recording…" : "Ready");
     });
 
-    // Listen for status updates from background
+    // Listen for authoritative updates
     const handler = (msg) => {
-      if (msg?.type === 'RECORDING_STATUS') {
-        setRecording(!!msg.isRecording);
-        if (!msg.isRecording) {
-          setCountdown(0);
-          if (countdownRef.current) {
-            clearInterval(countdownRef.current);
-            countdownRef.current = null;
-          }
-        }
+      if (msg?.type === "RECORDING_STATUS") {
+        setIsRecording(!!msg.isRecording);
+        setStatus(msg.isRecording ? "Recording…" : "Ready");
+      }
+
+      if (msg?.type === "RECORDING_ERROR") {
+        setStatus("Error");
+        alert(msg.error || "Recording failed");
       }
     };
 
     chrome.runtime.onMessage.addListener(handler);
-    return () => {
-      try { chrome.runtime.onMessage.removeListener(handler); } catch (e) {}
-      if (countdownRef.current) {
-        clearInterval(countdownRef.current);
-        countdownRef.current = null;
-      }
-    };
+    return () => chrome.runtime.onMessage.removeListener(handler);
   }, []);
 
-  const start = async () => {
-    // Prevent multiple countdowns or starting while already recording
-    if (recording || countdown > 0) return;
+  // ─────────────────────────────────────────────
+  // User actions ONLY
+  // ─────────────────────────────────────────────
+  const startRecording = async () => {
+    if (isRecording) return;
 
-    let counter = 3;
-    setCountdown(counter);
-
-    const id = setInterval(() => {
-      counter -= 1;
-      if (counter <= 0) {
-        clearInterval(id);
-        countdownRef.current = null;
-        setCountdown(0);
-
-        try {
-          chrome.runtime.sendMessage({ type: 'START_RECORDING' });
-          setRecording(true);
-        } catch (err) {
-          console.error('start error', err);
-        }
-      } else {
-        setCountdown(counter);
-      }
-    }, 1000);
-
-    countdownRef.current = id;
-  };
-
-  const stop = () => {
     try {
-      chrome.runtime.sendMessage({ type: 'STOP_RECORDING' });
-      setRecording(false);
-      setCountdown(0);
-      if (countdownRef.current) {
-        clearInterval(countdownRef.current);
-        countdownRef.current = null;
-      }
-    } catch (err) {
-      console.error('stop error', err);
+      // Optional: mic gate only (screen is offscreen-owned)
+      await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch {
+      alert(
+        "Microphone permission is required to start recording.\n\n" +
+        "Please allow microphone access and try again."
+      );
+      return;
     }
+
+    chrome.runtime.sendMessage({ type: "START_RECORDING" });
+    setStatus("Starting…");
   };
 
+  const stopRecording = () => {
+    if (!isRecording) return;
+    chrome.runtime.sendMessage({ type: "STOP_RECORDING" });
+    setStatus("Stopping…");
+  };
+
+  // ─────────────────────────────────────────────
+  // UI
+  // ─────────────────────────────────────────────
   return (
-    <div style={{ padding: 18, width: 320, boxSizing: 'border-box', fontFamily: 'Inter, Arial, sans-serif' }}>
-      <h2>Clueso Recorder</h2>
-      <p>Records screen (video-only) and microphone (audio-only) separately and streams to your backend.</p>
+    <div
+      style={{
+        padding: 16,
+        width: 300,
+        fontFamily: "Inter, Arial, sans-serif",
+        boxSizing: "border-box"
+      }}
+    >
+      <h3 style={{ marginTop: 0 }}>Clueso Recorder</h3>
 
-      {countdown > 0 && !recording && (
-        <div style={{ marginTop: 8, marginBottom: 4, color: '#d97706', fontWeight: 500 }}>
-          Starting in {countdown}...
-        </div>
-      )}
-
-      <div style={{ marginTop: 12 }}>
-        <button
-          onClick={start}
-          disabled={recording || countdown > 0}
-          style={{ padding: '8px 12px', fontSize: 14 }}
-        >
-          {countdown > 0 ? `Starting...` : 'Start Recording'}
-        </button>
-        <button
-          onClick={stop}
-          disabled={!recording}
-          style={{ padding: '8px 12px', fontSize: 14, marginLeft: 8 }}
-        >
-          Stop Recording
-        </button>
+      <div style={{ marginBottom: 12, color: "#555" }}>
+        Status: <strong>{status}</strong>
       </div>
 
-      <small style={{ display: 'block', marginTop: 12, color: '#666' }}>
-        Make sure to set backend URLs in offscreen.js
+      <button
+        onClick={startRecording}
+        disabled={isRecording}
+        style={{ padding: "8px 12px", width: "100%" }}
+      >
+        Start Recording
+      </button>
+
+      <button
+        onClick={stopRecording}
+        disabled={!isRecording}
+        style={{ padding: "8px 12px", width: "100%", marginTop: 8 }}
+      >
+        Stop Recording
+      </button>
+
+      <small style={{ display: "block", marginTop: 12, color: "#777" }}>
+        Screen selection will be requested after starting.
       </small>
     </div>
   );

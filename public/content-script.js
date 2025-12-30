@@ -1,379 +1,181 @@
-// content-script.js
-// DOM Event Capture Script - Injected into web pages to capture user interactions
+// content-script.js — Pure DOM event sensor
 
-let recordingStartTime = null;
-let events = [];
+console.log("[content] loaded");
+
+// ─────────────────────────────────────────────
+// State
+// ─────────────────────────────────────────────
 let isRecording = false;
-let scrollTimeout = null;
+let sessionId = null;
+let startTime = null;
+
+// Keep references for cleanup
+let listeners = [];
 let mutationObserver = null;
-let currentSessionId = null;
-// ✅ SAFE FIX #10: Track last scroll position for threshold
-let lastScrollY = 0;
-let lastScrollX = 0;
 
-// Initialize recording session
-function startRecording(sessionId) {
-  recordingStartTime = Date.now();
-  events = [];
-  isRecording = true;
-  currentSessionId = sessionId;
-  lastScrollY = window.scrollY;
-  lastScrollX = window.scrollX;
-  attachEventListeners();
-  startMutationObserver();
-  console.log('[content-script] Recording started with sessionId:', sessionId);
-}
-
-function stopRecording() {
-  isRecording = false;
-  removeEventListeners();
-  stopMutationObserver();
-
-  const sessionData = {
-    sessionId: currentSessionId,
-    startTime: recordingStartTime,
-    endTime: Date.now(),
-    url: window.location.href,
-    viewport: {
-      width: window.innerWidth,
-      height: window.innerHeight
-    },
-    events: events
-  };
-
-  console.log('[content-script] Recording stopped, sessionId:', currentSessionId);
-  console.log('[content-script] Events captured:', events.length);
-  return sessionData;
-}
-
-// Attach event listeners
-function attachEventListeners() {
-  // Click events
-  document.addEventListener('click', handleClick, true); // Use capture phase
-
-  // Input events
-  document.addEventListener('input', handleInput, true);
-  document.addEventListener('change', handleChange, true);
-
-  // Focus events
-  document.addEventListener('focus', handleFocus, true);
-  document.addEventListener('blur', handleBlur, true);
-
-  // Scroll events (debounced)
-  window.addEventListener('scroll', handleScrollDebounced, true);
-
-  // Page navigation detection
-  window.addEventListener('popstate', handleStepChange);
-
-  // Intercept pushState/replaceState for SPA navigation
-  const originalPushState = history.pushState;
-  const originalReplaceState = history.replaceState;
-
-  history.pushState = function (...args) {
-    originalPushState.apply(history, args);
-    handleStepChange();
-  };
-
-  history.replaceState = function (...args) {
-    originalReplaceState.apply(history, args);
-    handleStepChange();
-  };
-}
-
-function removeEventListeners() {
-  document.removeEventListener('click', handleClick, true);
-  document.removeEventListener('input', handleInput, true);
-  document.removeEventListener('change', handleChange, true);
-  document.removeEventListener('focus', handleFocus, true);
-  document.removeEventListener('blur', handleBlur, true);
-  window.removeEventListener('scroll', handleScrollDebounced, true);
-  window.removeEventListener('popstate', handleStepChange);
-}
-
-// Click event handler
-function handleClick(e) {
-  if (!isRecording) return;
-
-  const target = e.target;
-  const bbox = target.getBoundingClientRect();
-
-  const event = {
-    timestamp: Date.now() - recordingStartTime,
-    type: 'click',
-    target: {
-      tag: target.tagName,
-      id: target.id || null,
-      classes: Array.from(target.classList),
-      text: getVisibleText(target),
-      selector: generateSelector(target),
-      bbox: {
-        x: Math.round(bbox.x),
-        y: Math.round(bbox.y),
-        width: Math.round(bbox.width),
-        height: Math.round(bbox.height)
-      },
-      attributes: getImportantAttributes(target)
-    },
-    metadata: {
-      url: window.location.href,
-      viewport: {
-        width: window.innerWidth,
-        height: window.innerHeight
-      }
-    }
-  };
-
-  events.push(event);
-  sendEventToBackground(event);
-}
-
-// Input event handler
-function handleInput(e) {
-  if (!isRecording) return;
-
-  const target = e.target;
-  if (!target.matches('input, textarea, select')) return;
-
-  const bbox = target.getBoundingClientRect();
-
-  const event = {
-    timestamp: Date.now() - recordingStartTime,
-    type: 'type',
-    target: {
-      tag: target.tagName,
-      id: target.id || null,
-      classes: Array.from(target.classList),
-      text: null,
-      selector: generateSelector(target),
-      bbox: {
-        x: Math.round(bbox.x),
-        y: Math.round(bbox.y),
-        width: Math.round(bbox.width),
-        height: Math.round(bbox.height)
-      },
-      attributes: getImportantAttributes(target),
-      type: target.type || null,
-      name: target.name || null
-    },
-    value: target.value,
-    metadata: {
-      url: window.location.href,
-      viewport: {
-        width: window.innerWidth,
-        height: window.innerHeight
-      }
-    }
-  };
-
-  events.push(event);
-  sendEventToBackground(event);
-}
-
-// Change event handler (for select dropdowns, checkboxes, etc.)
-function handleChange(e) {
-  if (!isRecording) return;
-
-  const target = e.target;
-  if (!target.matches('input, textarea, select')) return;
-
-  const bbox = target.getBoundingClientRect();
-
-  const event = {
-    timestamp: Date.now() - recordingStartTime,
-    type: 'type',
-    target: {
-      tag: target.tagName,
-      id: target.id || null,
-      classes: Array.from(target.classList),
-      text: null,
-      selector: generateSelector(target),
-      bbox: {
-        x: Math.round(bbox.x),
-        y: Math.round(bbox.y),
-        width: Math.round(bbox.width),
-        height: Math.round(bbox.height)
-      },
-      attributes: getImportantAttributes(target),
-      type: target.type || null,
-      name: target.name || null
-    },
-    value: target.type === 'checkbox' || target.type === 'radio'
-      ? target.checked
-      : target.value,
-    metadata: {
-      url: window.location.href,
-      viewport: {
-        width: window.innerWidth,
-        height: window.innerHeight
-      }
-    }
-  };
-
-  events.push(event);
-  sendEventToBackground(event);
-}
-
-// Focus event handler
-function handleFocus(e) {
-  if (!isRecording) return;
-
-  const target = e.target;
-  if (!target.matches('input, textarea, select')) return;
-
-  const bbox = target.getBoundingClientRect();
-
-  const event = {
-    timestamp: Date.now() - recordingStartTime,
-    type: 'focus',
-    target: {
-      tag: target.tagName,
-      id: target.id || null,
-      classes: Array.from(target.classList),
-      text: null,
-      selector: generateSelector(target),
-      bbox: {
-        x: Math.round(bbox.x),
-        y: Math.round(bbox.y),
-        width: Math.round(bbox.width),
-        height: Math.round(bbox.height)
-      },
-      attributes: getImportantAttributes(target),
-      type: target.type || null,
-      name: target.name || null
-    },
-    metadata: {
-      url: window.location.href,
-      viewport: {
-        width: window.innerWidth,
-        height: window.innerHeight
-      }
-    }
-  };
-
-  events.push(event);
-}
-
-// Blur event handler
-function handleBlur(e) {
-  if (!isRecording) return;
-
-  const target = e.target;
-  if (!target.matches('input, textarea, select')) return;
-
-  const bbox = target.getBoundingClientRect();
-
-  const event = {
-    timestamp: Date.now() - recordingStartTime,
-    type: 'blur',
-    target: {
-      tag: target.tagName,
-      id: target.id || null,
-      classes: Array.from(target.classList),
-      text: null,
-      selector: generateSelector(target),
-      bbox: {
-        x: Math.round(bbox.x),
-        y: Math.round(bbox.y),
-        width: Math.round(bbox.width),
-        height: Math.round(bbox.height)
-      },
-      attributes: getImportantAttributes(target),
-      type: target.type || null,
-      name: target.name || null
-    },
-    metadata: {
-      url: window.location.href,
-      viewport: {
-        width: window.innerWidth,
-        height: window.innerHeight
-      }
-    }
-  };
-
-  events.push(event);
-}
-
-// Debounced scroll handler
-function handleScrollDebounced() {
-  if (!isRecording) return;
-
-  clearTimeout(scrollTimeout);
-  scrollTimeout = setTimeout(() => {
-    handleScroll();
-  }, 300);
-}
-
-// Scroll event handler
-function handleScroll() {
-  if (!isRecording) return;
-
-  // ✅ SAFE FIX #10: Only record scroll if moved more than 100px
-  const scrollDistanceY = Math.abs(window.scrollY - lastScrollY);
-  const scrollDistanceX = Math.abs(window.scrollX - lastScrollX);
-
-  if (scrollDistanceY < 100 && scrollDistanceX < 100) {
-    return; // Not enough movement, ignore
+// ─────────────────────────────────────────────
+// Messaging
+// ─────────────────────────────────────────────
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg?.type === "PING") {
+    sendResponse({ ready: true });
+    return true;
   }
 
-  lastScrollY = window.scrollY;
-  lastScrollX = window.scrollX;
+  if (msg?.type === "START_RECORDING") {
+    ({ sessionId, startTime } = msg);
+    startDomCapture();
+    sendResponse({ success: true });
+    return true;
+  }
 
-  const event = {
-    timestamp: Date.now() - recordingStartTime,
-    type: 'scroll',
-    metadata: {
-      url: window.location.href,
-      viewport: {
-        width: window.innerWidth,
-        height: window.innerHeight
-      },
-      scrollPosition: {
-        x: window.scrollX,
-        y: window.scrollY
-      }
-    }
-  };
+  if (msg?.type === "STOP_RECORDING") {
+    stopDomCapture();
+    sendResponse({ success: true });
+    return true;
+  }
+});
 
-  events.push(event);
+// ─────────────────────────────────────────────
+// Recording lifecycle
+// ─────────────────────────────────────────────
+function startDomCapture() {
+  if (isRecording) return;
+
+  isRecording = true;
+  console.log("[content] DOM capture started", sessionId);
+
+  addListener("click", handleClick, true);
+  addListener("scroll", handleScroll, true);
+  addListener("input", handleInput, true);
+
+  observeDomMutations();
 }
 
-// Step change handler (page navigation, major UI changes)
-function handleStepChange() {
+function stopDomCapture() {
   if (!isRecording) return;
 
-  const event = {
-    timestamp: Date.now() - recordingStartTime,
-    type: 'step_change',
-    metadata: {
-      url: window.location.href,
-      viewport: {
-        width: window.innerWidth,
-        height: window.innerHeight
-      }
-    }
-  };
+  isRecording = false;
+  console.log("[content] DOM capture stopped", sessionId);
 
-  events.push(event);
+  listeners.forEach(({ type, handler, options }) => {
+    window.removeEventListener(type, handler, options);
+  });
+  listeners = [];
+
+  if (mutationObserver) {
+    mutationObserver.disconnect();
+    mutationObserver = null;
+  }
+
+  sessionId = null;
+  startTime = null;
 }
 
-// Mutation observer for detecting major DOM changes (modals, etc.)
-function startMutationObserver() {
-  mutationObserver = new MutationObserver((mutations) => {
-    if (!isRecording) return;
+// ─────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────
+function addListener(type, handler, options) {
+  window.addEventListener(type, handler, options);
+  listeners.push({ type, handler, options });
+}
 
-    // Detect major UI changes (modals, page transitions)
-    const hasMajorChange = mutations.some(mutation => {
-      return mutation.addedNodes.length > 5 ||
-        mutation.removedNodes.length > 5 ||
-        Array.from(mutation.addedNodes).some(node =>
-          node.nodeType === 1 &&
-          (node.matches?.('dialog, [role="dialog"], .modal, .overlay') || false)
-        );
-    });
+function now() {
+  return Date.now() - startTime;
+}
 
-    if (hasMajorChange) {
-      handleStepChange();
+function sendEvent(event) {
+  if (!isRecording) return;
+
+  try {
+    if (!chrome.runtime?.id) return;
+
+    chrome.runtime.sendMessage(
+      { type: "EVENT_CAPTURED", event },
+      () => {
+        // Ignore teardown errors
+        if (chrome.runtime.lastError) { }
+      }
+    );
+  } catch {
+    console.log("Extension context already invalidated");
+  }
+}
+
+
+// ─────────────────────────────────────────────
+// Event handlers
+// ─────────────────────────────────────────────
+function handleClick(e) {
+  const target = e.target;
+  if (!(target instanceof Element)) return;
+
+  sendEvent({
+    source: "dom",
+    type: "click",
+    timestamp: now(),
+    target: serializeTarget(target),
+    metadata: baseMetadata()
+  });
+}
+
+let lastScrollY = window.scrollY;
+let lastScrollTime = 0;
+
+function handleScroll() {
+  const y = window.scrollY;
+  const delta = Math.abs(y - lastScrollY);
+  const t = Date.now();
+
+  if (delta < 80 && t - lastScrollTime < 300) return;
+
+  lastScrollY = y;
+  lastScrollTime = t;
+
+  sendEvent({
+    source: "dom",
+    type: "scroll",
+    timestamp: now(),
+    metadata: {
+      ...baseMetadata(),
+      scrollPosition: { x: window.scrollX, y }
     }
+  });
+}
+
+function handleInput(e) {
+  const target = e.target;
+  if (!(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement)) return;
+
+  // 🚨 Never capture sensitive input values
+  if (target.type === "password") return;
+
+  sendEvent({
+    source: "dom",
+    type: "input",
+    timestamp: now(),
+    target: serializeTarget(target),
+    metadata: baseMetadata()
+  });
+}
+
+// ─────────────────────────────────────────────
+// Mutation observer (for SPA navigation / step changes)
+// ─────────────────────────────────────────────
+function observeDomMutations() {
+  let lastMutation = 0;
+
+  mutationObserver = new MutationObserver(() => {
+    const t = Date.now();
+    if (t - lastMutation < 500) return;
+    lastMutation = t;
+
+    sendEvent({
+      source: "dom",
+      type: "dom_mutation",
+      timestamp: now(),
+      metadata: baseMetadata()
+    });
   });
 
   mutationObserver.observe(document.body, {
@@ -382,118 +184,62 @@ function startMutationObserver() {
   });
 }
 
-function stopMutationObserver() {
-  if (mutationObserver) {
-    mutationObserver.disconnect();
-    mutationObserver = null;
-  }
+// ─────────────────────────────────────────────
+// Serialization helpers
+// ─────────────────────────────────────────────
+function serializeTarget(el) {
+  const rect = el.getBoundingClientRect();
+
+  return {
+    tag: el.tagName,
+    id: el.id || null,
+    classes: [...el.classList],
+    text: el.innerText?.slice(0, 100) || null,
+    selector: buildSelector(el),
+    bbox: {
+      x: Math.round(rect.x),
+      y: Math.round(rect.y),
+      width: Math.round(rect.width),
+      height: Math.round(rect.height)
+    },
+    attributes: getSafeAttributes(el)
+  };
 }
 
-// Generate CSS selector for element
-function generateSelector(element) {
-  if (element.id) {
-    return `#${element.id}`;
-  }
+function buildSelector(el) {
+  if (el.id) return `#${el.id}`;
 
-  if (element.className) {
-    const classes = Array.from(element.classList)
-      .filter(cls => !cls.startsWith('_')) // Filter out framework classes
-      .join('.');
-    if (classes) {
-      return `${element.tagName.toLowerCase()}.${classes}`;
+  let path = [];
+  while (el && el.nodeType === Node.ELEMENT_NODE && path.length < 4) {
+    let selector = el.tagName.toLowerCase();
+    if (el.classList.length) {
+      selector += "." + [...el.classList].slice(0, 2).join(".");
     }
-  }
-
-  // Fallback: use path
-  const path = [];
-  let current = element;
-  while (current && current !== document.body) {
-    let selector = current.tagName.toLowerCase();
-    if (current.id) {
-      selector += `#${current.id}`;
-      path.unshift(selector);
-      break;
-    }
-    if (current.className) {
-      const classes = Array.from(current.classList)
-        .filter(cls => !cls.startsWith('_'))
-        .slice(0, 2) // Limit classes
-        .join('.');
-      if (classes) selector += `.${classes}`;
-    }
-
-    const siblings = Array.from(current.parentElement?.children || [])
-      .filter(el => el.tagName === current.tagName);
-    if (siblings.length > 1) {
-      const index = siblings.indexOf(current) + 1;
-      selector += `:nth-of-type(${index})`;
-    }
-
     path.unshift(selector);
-    current = current.parentElement;
+    el = el.parentElement;
   }
-
-  return path.join(' > ');
+  return path.join(" > ");
 }
 
-// Get visible text content
-function getVisibleText(element) {
-  // Get text content, excluding hidden elements
-  const clone = element.cloneNode(true);
-  const hidden = clone.querySelectorAll('[style*="display: none"], [style*="visibility: hidden"], [hidden]');
-  hidden.forEach(el => el.remove());
-
-  return clone.textContent?.trim() || null;
-}
-
-// Get important attributes
-function getImportantAttributes(element) {
-  const important = ['data-testid', 'aria-label', 'aria-labelledby', 'name', 'type', 'role'];
+function getSafeAttributes(el) {
+  const allowed = ["data-testid", "aria-label", "role"];
   const attrs = {};
 
-  important.forEach(attr => {
-    const value = element.getAttribute(attr);
-    if (value) {
-      attrs[attr] = value;
+  allowed.forEach(name => {
+    if (el.hasAttribute(name)) {
+      attrs[name] = el.getAttribute(name);
     }
   });
 
   return attrs;
 }
 
-// Send event to background script (optional: real-time sync)
-function sendEventToBackground(event) {
-  try {
-    chrome.runtime.sendMessage({
-      type: 'EVENT_CAPTURED',
-      event: event
-    });
-  } catch (error) {
-    // Ignore errors if background script is not available
-    console.debug('[content-script] Could not send event to background:', error);
-  }
+function baseMetadata() {
+  return {
+    url: location.href,
+    viewport: {
+      width: window.innerWidth,
+      height: window.innerHeight
+    }
+  };
 }
-
-// Listen for messages from background script
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.type === 'PING') {
-    sendResponse({ success: true, ready: true });
-    return true;
-  }
-
-  if (message.type === 'START_RECORDING') {
-    startRecording(message.sessionId);
-    sendResponse({ success: true });
-    return true;
-  }
-
-  if (message.type === 'STOP_RECORDING') {
-    const sessionData = stopRecording();
-    sendResponse({ success: true, sessionData: sessionData });
-    return true;
-  }
-
-  return true; // Keep message channel open for async response
-});
-
-console.log('[content-script] Content script loaded');
