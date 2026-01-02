@@ -110,6 +110,9 @@ function handleClick(e) {
   const target = e.target;
   if (!(target instanceof Element)) return;
 
+  // Show visual click indicator
+  showClickIndicator(e.clientX, e.clientY);
+
   sendEvent({
     source: "dom",
     type: "click",
@@ -117,6 +120,100 @@ function handleClick(e) {
     target: serializeTarget(target),
     metadata: baseMetadata()
   });
+}
+
+// ─────────────────────────────────────────────
+// Click indicator visual feedback
+// ─────────────────────────────────────────────
+let activeIndicator = null;
+let indicatorTimeout = null;
+
+function showClickIndicator(x, y) {
+  // Remove any existing indicator immediately
+  if (activeIndicator) {
+    activeIndicator.remove();
+    activeIndicator = null;
+  }
+
+  // Clear any pending timeout
+  if (indicatorTimeout) {
+    clearTimeout(indicatorTimeout);
+    indicatorTimeout = null;
+  }
+
+  // Create the indicator element
+  const indicator = document.createElement('div');
+  indicator.className = 'clueso-click-indicator';
+
+  // Position it at the click coordinates
+  indicator.style.cssText = `
+    position: fixed;
+    left: ${x}px;
+    top: ${y}px;
+    width: 20px;
+    height: 20px;
+    background-color: #ed5252ff;
+    border: 1px solid white;
+    border-radius: 50%;
+    pointer-events: none;
+    z-index: 999999;
+    transform: translate(-50%, -50%) scale(1);
+    opacity: 1;
+    transition: opacity 0.3s ease-out, transform 0.3s ease-out;
+  `;
+
+  // Add to DOM immediately
+  document.body.appendChild(indicator);
+  activeIndicator = indicator;
+
+  // Track mouse movement to remove indicator when mouse moves away
+  const removeOnMouseMove = (e) => {
+    const dx = e.clientX - x;
+    const dy = e.clientY - y;
+    const distance = Math.sqrt(dx * dx + dy * dy);
+
+    // Remove if mouse moves more than 30px away
+    if (distance > 30) {
+      if (activeIndicator) {
+        // Trigger smooth fade-out
+        activeIndicator.style.opacity = '0';
+        activeIndicator.style.transform = 'translate(-50%, -50%) scale(0.5)';
+
+        // Remove from DOM after transition completes
+        setTimeout(() => {
+          if (activeIndicator) {
+            activeIndicator.remove();
+            activeIndicator = null;
+          }
+        }, 300);
+      }
+      window.removeEventListener('mousemove', removeOnMouseMove);
+      if (indicatorTimeout) {
+        clearTimeout(indicatorTimeout);
+        indicatorTimeout = null;
+      }
+    }
+  };
+
+  window.addEventListener('mousemove', removeOnMouseMove);
+
+  // Also remove after 2 seconds as fallback
+  indicatorTimeout = setTimeout(() => {
+    if (activeIndicator) {
+      // Trigger smooth fade-out
+      activeIndicator.style.opacity = '0';
+      activeIndicator.style.transform = 'translate(-50%, -50%) scale(0.5)';
+
+      // Remove from DOM after transition completes
+      setTimeout(() => {
+        if (activeIndicator) {
+          activeIndicator.remove();
+          activeIndicator = null;
+        }
+      }, 300);
+    }
+    window.removeEventListener('mousemove', removeOnMouseMove);
+  }, 2000);
 }
 
 let lastScrollY = window.scrollY;

@@ -3,10 +3,10 @@
 const OFFSCREEN_URL = "offscreen.html";
 
 // DOM streaming (batched)
-const DOM_EVENTS_URL = "http://localhost:3000/api/v1/recording/dom-events";
+const DOM_EVENTS_URL = "http://localhost:8000/api/v1/recording/dom-events";
 
 // Final confirmation
-const FINALIZE_URL = "http://localhost:3000/api/v1/recording/finalize";
+const FINALIZE_URL = "http://localhost:8000/api/v1/recording/finalize";
 
 const DOM_BATCH_INTERVAL = 200; // ms
 
